@@ -215,13 +215,15 @@ jobs:
           void toast(BuildContext c, String m) =>
               ScaffoldMessenger.of(c).showSnackBar(SnackBar(content: Text(m)));
 
-          Future<void> main() async {
+                   Future<void> main() async {
             WidgetsFlutterBinding.ensureInitialized();
             await Store.load();
-            await initNotif();
             themeN.value = modeOf(Store.s['theme']);
-            await reschedule();
             runApp(const App());
+            try {
+              await initNotif();
+              await reschedule();
+            } catch (_) {}
           }
 
           class App extends StatelessWidget {
