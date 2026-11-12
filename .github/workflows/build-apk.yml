@@ -98,7 +98,13 @@ jobs:
                 ?.requestNotificationsPermission();
           }
 
-          Future<void> reschedule() async {
+                    Future<void> reschedule() async {
+            try {
+              await _reschedule();
+            } catch (_) {}
+          }
+
+          Future<void> _reschedule() async {
             await np.cancelAll();
             final now = tz.TZDateTime.now(tz.local);
             for (final c in Store.cases) {
@@ -643,6 +649,7 @@ jobs:
           g='app/android/app/build.gradle'
           t=open(g).read()
           t=t.replace('compileOptions {','compileOptions {\n        coreLibraryDesugaringEnabled true',1)
+                    t=t.replace('signingConfig signingConfigs.debug','signingConfig signingConfigs.debug\n            minifyEnabled false\n            shrinkResources false')
           t+="\ndependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.4'\n}\n"
           open(g,'w').write(t)
           m='app/android/app/src/main/AndroidManifest.xml'
