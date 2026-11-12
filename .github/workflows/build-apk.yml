@@ -98,7 +98,7 @@ jobs:
                 ?.requestNotificationsPermission();
           }
 
-                    Future<void> reschedule() async {
+          Future<void> reschedule() async {
             try {
               await _reschedule();
             } catch (_) {}
@@ -221,7 +221,7 @@ jobs:
           void toast(BuildContext c, String m) =>
               ScaffoldMessenger.of(c).showSnackBar(SnackBar(content: Text(m)));
 
-                   Future<void> main() async {
+          Future<void> main() async {
             WidgetsFlutterBinding.ensureInitialized();
             await Store.load();
             themeN.value = modeOf(Store.s['theme']);
@@ -638,10 +638,6 @@ jobs:
           rm -rf app/test app/lib
           cp -r src/lib app/lib
           cp src/pubspec.yaml app/pubspec.yaml
-      - name: Use fixed signing key if present
-        run: |
-          mkdir -p ~/.android
-          if [ -f debug.keystore ]; then cp debug.keystore ~/.android/debug.keystore; fi
       - name: Patch Gradle and Manifest
         run: |
           python3 - <<'PY'
@@ -649,7 +645,7 @@ jobs:
           g='app/android/app/build.gradle'
           t=open(g).read()
           t=t.replace('compileOptions {','compileOptions {\n        coreLibraryDesugaringEnabled true',1)
-                    t=t.replace('signingConfig signingConfigs.debug','signingConfig signingConfigs.debug\n            minifyEnabled false\n            shrinkResources false')
+          t=t.replace('signingConfig signingConfigs.debug','signingConfig signingConfigs.debug\n            minifyEnabled false\n            shrinkResources false')
           t+="\ndependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.4'\n}\n"
           open(g,'w').write(t)
           m='app/android/app/src/main/AndroidManifest.xml'
