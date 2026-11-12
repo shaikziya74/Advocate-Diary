@@ -17,17 +17,623 @@ jobs:
           flutter-version: '3.24.5'
           channel: stable
           cache: true
+      - name: Write app code
+        run: |
+          mkdir -p src/lib
+          cat > src/pubspec.yaml <<'EOF'
+          name: advocate_diary
+          description: Case diary for advocates. Made by Shaik Ziya
+          publish_to: none
+          version: 1.0.0+1
+          environment:
+            sdk: '>=3.3.0 <4.0.0'
+          dependencies:
+            flutter:
+              sdk: flutter
+            archive: ^3.6.1
+            extension_google_sign_in_as_googleapis_auth: ^2.0.12
+            file_picker: ^8.1.2
+            flutter_local_notifications: 17.2.4
+            google_sign_in: ^6.2.1
+            googleapis: ^13.2.0
+            image_picker: ^1.1.2
+            intl: ^0.19.0
+            path_provider: ^2.1.4
+            share_plus: ^10.0.2
+            timezone: ^0.9.4
+          flutter:
+            uses-material-design: true
+          EOF
+          cat > src/lib/main.dart <<'EOF'
+          import 'dart:convert';
+          import 'dart:io';
+          import 'package:archive/archive.dart';
+          import 'package:extension_google_sign_in_as_googleapis_auth/extension_google_sign_in_as_googleapis_auth.dart';
+          import 'package:file_picker/file_picker.dart';
+          import 'package:flutter/material.dart';
+          import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+          import 'package:google_sign_in/google_sign_in.dart';
+          import 'package:googleapis/drive/v3.dart' as drive;
+          import 'package:image_picker/image_picker.dart';
+          import 'package:intl/intl.dart';
+          import 'package:path_provider/path_provider.dart';
+          import 'package:share_plus/share_plus.dart';
+          import 'package:timezone/data/latest.dart' as tzd;
+          import 'package:timezone/timezone.dart' as tz;
+
+          final fmt = DateFormat('dd MMM yyyy');
+          final themeN = ValueNotifier<ThemeMode>(ThemeMode.system);
+
+          class Store {
+            static late Directory dir;
+            static Map<String, dynamic> db = {};
+            static Map get s => db['settings'] as Map;
+            static List get cases => db['cases'] as List;
+            static Future<void> load() async {
+              dir = await getApplicationDocumentsDirectory();
+              Directory('${dir.path}/img').createSync(recursive: true);
+              final f = File('${dir.path}/data.json');
+              db = f.existsSync() ? jsonDecode(f.readAsStringSync()) : {};
+              db.putIfAbsent('seq', () => 1);
+              db.putIfAbsent('cases', () => []);
+              db.putIfAbsent('settings', () => {});
+              s.putIfAbsent('theme', () => 'system');
+              s.putIfAbsent('days', () => [1, 2]);
+              s.putIfAbsent('hour', () => 8);
+              s.putIfAbsent('minute', () => 0);
+              s.putIfAbsent('auto', () => false);
+              s.putIfAbsent('interval', () => 1);
+            }
+            static void save() => File('${dir.path}/data.json').writeAsStringSync(jsonEncode(db));
+          }
+
+          final np = FlutterLocalNotificationsPlugin();
+          Future<void> initNotif() async {
+            tzd.initializeTimeZones();
+            tz.setLocalLocation(tz.getLocation('Asia/Kolkata'));
+            await np.initialize(const InitializationSettings(
+                android: AndroidInitializationSettings('@mipmap/ic_launcher')));
+            await np
+                .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+                ?.requestNotificationsPermission();
+          }
+
+          Future<void> reschedule() async {
+            await np.cancelAll();
+            final now = tz.TZDateTime.now(tz.local);
+            for (final c in Store.cases) {
+              final nd = DateTime.tryParse(c['date'] ?? '');
+              if (nd == null) continue;
+              for (final d in List<int>.from(Store.s['days'])) {
+                final t = tz.TZDateTime(tz.local, nd.year, nd.month, nd.day - d,
+                    Store.s['hour'], Store.s['minute']);
+                if (!t.isAfter(now)) continue;
+                await np.zonedSchedule(
+                  (c['id'] as int) * 10 + d,
+                  'Case ${c['no']}',
+                  '${c['party']} - hearing ${d == 0 ? 'today' : 'in $d day(s)'} (${fmt.format(nd)})',
+                  t,
+                  const NotificationDetails(
+                      android: AndroidNotificationDetails('hearing', 'Hearing reminders',
+                          importance: Importance.high, priority: Priority.high)),
+                  androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+                  uiLocalNotificationDateInterpretation:
+                      UILocalNotificationDateInterpretation.absoluteTime,
+                );
+              }
+            }
+          }
+
+          List<int> buildZip() {
+            final a = Archive();
+            final data = utf8.encode(jsonEncode(Store.db));
+            a.addFile(ArchiveFile('data.json', data.length, data));
+            for (final f in Directory('${Store.dir.path}/img').listSync().whereType<File>()) {
+              final b = f.readAsBytesSync();
+              a.addFile(ArchiveFile('img/${f.uri.pathSegments.last}', b.length, b));
+            }
+            return ZipEncoder().encode(a)!;
+          }
+
+          Future<void> restoreZip(List<int> bytes) async {
+            final a = ZipDecoder().decodeBytes(bytes);
+            for (final f in a) {
+              if (!f.isFile) continue;
+              final name = f.name.split('/').last;
+              final path = f.name == 'data.json' ? 'data.json' : 'img/$name';
+              File('${Store.dir.path}/$path').writeAsBytesSync(f.content as List<int>);
+            }
+            await Store.load();
+            await reschedule();
+          }
+
+          final gsi = GoogleSignIn(scopes: [drive.DriveApi.driveAppdataScope]);
+          const bkName = 'advocate_diary_backup.zip';
+
+          Future<drive.DriveApi?> driveApi(bool interactive) async {
+            final acc = gsi.currentUser ??
+                await gsi.signInSilently() ??
+                (interactive ? await gsi.signIn() : null);
+            if (acc == null) return null;
+            final client = await gsi.authenticatedClient();
+            return client == null ? null : drive.DriveApi(client);
+          }
+
+          Future<String?> driveFileId(drive.DriveApi api) async {
+            final l = await api.files.list(
+                spaces: 'appDataFolder', q: "name = '$bkName'", $fields: 'files(id)');
+            return (l.files?.isNotEmpty ?? false) ? l.files!.first.id : null;
+          }
+
+          Future<bool> driveUpload({bool interactive = true}) async {
+            final api = await driveApi(interactive);
+            if (api == null) return false;
+            final bytes = buildZip();
+            final media = drive.Media(Stream.value(bytes), bytes.length);
+            final id = await driveFileId(api);
+            if (id == null) {
+              await api.files.create(
+                  drive.File()..name = bkName..parents = ['appDataFolder'],
+                  uploadMedia: media);
+            } else {
+              await api.files.update(drive.File(), id, uploadMedia: media);
+            }
+            Store.s['last'] = DateTime.now().toIso8601String();
+            Store.save();
+            return true;
+          }
+
+          Future<bool> driveRestore() async {
+            final api = await driveApi(true);
+            if (api == null) return false;
+            final id = await driveFileId(api);
+            if (id == null) return false;
+            final m = await api.files.get(id,
+                downloadOptions: drive.DownloadOptions.fullMedia) as drive.Media;
+            final out = <int>[];
+            await for (final c in m.stream) {
+              out.addAll(c);
+            }
+            await restoreZip(out);
+            return true;
+          }
+
+          Future<void> autoBackup() async {
+            if (Store.s['auto'] != true) return;
+            final last = DateTime.tryParse(Store.s['last'] ?? '');
+            if (last == null ||
+                DateTime.now().difference(last).inDays >= (Store.s['interval'] as int)) {
+              try {
+                await driveUpload(interactive: false);
+              } catch (_) {}
+            }
+          }
+
+          ThemeMode modeOf(String s) =>
+              s == 'dark' ? ThemeMode.dark : s == 'light' ? ThemeMode.light : ThemeMode.system;
+
+          void toast(BuildContext c, String m) =>
+              ScaffoldMessenger.of(c).showSnackBar(SnackBar(content: Text(m)));
+
+          Future<void> main() async {
+            WidgetsFlutterBinding.ensureInitialized();
+            await Store.load();
+            await initNotif();
+            themeN.value = modeOf(Store.s['theme']);
+            await reschedule();
+            runApp(const App());
+          }
+
+          class App extends StatelessWidget {
+            const App({super.key});
+            @override
+            Widget build(BuildContext context) => ValueListenableBuilder<ThemeMode>(
+                  valueListenable: themeN,
+                  builder: (_, m, __) => MaterialApp(
+                    title: 'Advocate Diary',
+                    debugShowCheckedModeBanner: false,
+                    themeMode: m,
+                    theme: ThemeData(colorSchemeSeed: const Color(0xFF1A3A6B), useMaterial3: true),
+                    darkTheme: ThemeData(
+                        colorSchemeSeed: const Color(0xFF1A3A6B),
+                        brightness: Brightness.dark,
+                        useMaterial3: true),
+                    home: const Home(),
+                  ),
+                );
+          }
+
+          class Home extends StatefulWidget {
+            const Home({super.key});
+            @override
+            State<Home> createState() => _HomeState();
+          }
+
+          class _HomeState extends State<Home> with WidgetsBindingObserver {
+            String range = 'Week';
+            String q = '';
+            static const ranges = {'Today': 0, 'Week': 7, 'Month': 30, 'Year': 365, 'All': -1};
+
+            @override
+            void initState() {
+              super.initState();
+              WidgetsBinding.instance.addObserver(this);
+              autoBackup();
+            }
+
+            @override
+            void dispose() {
+              WidgetsBinding.instance.removeObserver(this);
+              super.dispose();
+            }
+
+            @override
+            void didChangeAppLifecycleState(AppLifecycleState s) {
+              if (s == AppLifecycleState.paused) autoBackup();
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final today = DateTime.now();
+              final t0 = DateTime(today.year, today.month, today.day);
+              final n = ranges[range]!;
+              final list = Store.cases.cast<Map>().where((c) {
+                if (q.isNotEmpty) {
+                  final k = q.toLowerCase();
+                  return '${c['no']}'.toLowerCase().contains(k) ||
+                      '${c['party']}'.toLowerCase().contains(k);
+                }
+                if (n < 0) return true;
+                final d = DateTime.tryParse(c['date'] ?? '');
+                if (d == null) return false;
+                return !d.isBefore(t0) && !d.isAfter(t0.add(Duration(days: n)));
+              }).toList()
+                ..sort((a, b) => '${a['date']}'.compareTo('${b['date']}'));
+              return Scaffold(
+                appBar: AppBar(title: const Text('Advocate Diary'), actions: [
+                  IconButton(
+                      icon: const Icon(Icons.settings),
+                      onPressed: () async {
+                        await Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsPage()));
+                        setState(() {});
+                      })
+                ]),
+                body: Column(children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                    child: TextField(
+                      decoration: const InputDecoration(
+                          prefixIcon: Icon(Icons.search),
+                          hintText: 'Search case no or name',
+                          border: OutlineInputBorder()),
+                      onChanged: (v) => setState(() => q = v.trim()),
+                    ),
+                  ),
+                  SizedBox(
+                    height: 52,
+                    child: ListView(scrollDirection: Axis.horizontal, padding: const EdgeInsets.all(8), children: [
+                      for (final r in ranges.keys)
+                        Padding(
+                          padding: const EdgeInsets.only(right: 8),
+                          child: ChoiceChip(
+                              label: Text(r), selected: range == r, onSelected: (_) => setState(() => range = r)),
+                        )
+                    ]),
+                  ),
+                  Expanded(
+                    child: list.isEmpty
+                        ? const Center(child: Text('No cases found'))
+                        : ListView.builder(
+                            itemCount: list.length,
+                            itemBuilder: (_, i) {
+                              final c = list[i];
+                              final d = DateTime.tryParse(c['date'] ?? '');
+                              final left = d?.difference(t0).inDays;
+                              return Card(
+                                margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                                child: ListTile(
+                                  leading: CircleAvatar(
+                                      child: Text(left == null ? '-' : left < 0 ? '!' : '$left')),
+                                  title: Text('${c['no']}  •  ${c['party']}'),
+                                  subtitle: Text(
+                                      '${c['court'] ?? ''}\nNext: ${d == null ? '-' : fmt.format(d)}'),
+                                  isThreeLine: true,
+                                  onTap: () async {
+                                    await Navigator.push(context,
+                                        MaterialPageRoute(builder: (_) => CasePage(c: c as Map<String, dynamic>)));
+                                    setState(() {});
+                                  },
+                                ),
+                              );
+                            }),
+                  ),
+                ]),
+                floatingActionButton: FloatingActionButton.extended(
+                  icon: const Icon(Icons.add),
+                  label: const Text('New case'),
+                  onPressed: () async {
+                    await Navigator.push(context, MaterialPageRoute(builder: (_) => const CasePage()));
+                    setState(() {});
+                  },
+                ),
+                bottomNavigationBar: const SafeArea(
+                    child: Padding(
+                        padding: EdgeInsets.all(8),
+                        child: Text('Made by Shaik Ziya',
+                            textAlign: TextAlign.center, style: TextStyle(fontWeight: FontWeight.w600)))),
+              );
+            }
+          }
+
+          class CasePage extends StatefulWidget {
+            final Map<String, dynamic>? c;
+            const CasePage({super.key, this.c});
+            @override
+            State<CasePage> createState() => _CasePageState();
+          }
+
+          class _CasePageState extends State<CasePage> {
+            late final no = TextEditingController(text: widget.c?['no']);
+            late final party = TextEditingController(text: widget.c?['party']);
+            late final court = TextEditingController(text: widget.c?['court']);
+            late final notes = TextEditingController(text: widget.c?['notes']);
+            late DateTime? date = DateTime.tryParse(widget.c?['date'] ?? '');
+            late List<String> imgs = List<String>.from(widget.c?['imgs'] ?? []);
+            late List hist = List.from(widget.c?['hist'] ?? []);
+
+            Future<void> pick(ImageSource s) async {
+              final x = await ImagePicker().pickImage(source: s, imageQuality: 80);
+              if (x == null) return;
+              final name = '${DateTime.now().microsecondsSinceEpoch}.jpg';
+              await File(x.path).copy('${Store.dir.path}/img/$name');
+              setState(() => imgs.add(name));
+            }
+
+            void save() {
+              if (no.text.trim().isEmpty) return toast(context, 'Enter case number');
+              final old = widget.c?['date'] as String?;
+              final nw = date == null ? null : DateFormat('yyyy-MM-dd').format(date!);
+              final m = widget.c ?? <String, dynamic>{};
+              if (widget.c == null) {
+                m['id'] = Store.db['seq'];
+                Store.db['seq'] = (Store.db['seq'] as int) + 1;
+                Store.cases.add(m);
+              } else if (old != null && nw != null && old != nw) {
+                hist.add({'from': old, 'to': nw, 'on': DateTime.now().toIso8601String()});
+              }
+              m..['no'] = no.text.trim()..['party'] = party.text.trim()..['court'] = court.text.trim()
+                ..['notes'] = notes.text..['date'] = nw..['imgs'] = imgs..['hist'] = hist;
+              Store.save();
+              reschedule();
+              Navigator.pop(context);
+            }
+
+            @override
+            Widget build(BuildContext context) => Scaffold(
+                  appBar: AppBar(title: Text(widget.c == null ? 'New case' : 'Case details'), actions: [
+                    if (widget.c != null)
+                      IconButton(
+                          icon: const Icon(Icons.delete),
+                          onPressed: () {
+                            Store.cases.remove(widget.c);
+                            Store.save();
+                            reschedule();
+                            Navigator.pop(context);
+                          }),
+                    IconButton(icon: const Icon(Icons.check), onPressed: save),
+                  ]),
+                  body: ListView(padding: const EdgeInsets.all(12), children: [
+                    TextField(controller: no, decoration: const InputDecoration(labelText: 'Case number')),
+                    TextField(controller: party, decoration: const InputDecoration(labelText: 'Person / party name')),
+                    TextField(controller: court, decoration: const InputDecoration(labelText: 'Court')),
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.event),
+                      title: Text(date == null ? 'Set next hearing / adjourned date' : fmt.format(date!)),
+                      onTap: () async {
+                        final d = await showDatePicker(
+                            context: context,
+                            initialDate: date ?? DateTime.now(),
+                            firstDate: DateTime(2000),
+                            lastDate: DateTime(2100));
+                        if (d != null) setState(() => date = d);
+                      },
+                    ),
+                    TextField(controller: notes, maxLines: 4, decoration: const InputDecoration(labelText: 'Notes')),
+                    const SizedBox(height: 12),
+                    Row(children: [
+                      OutlinedButton.icon(
+                          onPressed: () => pick(ImageSource.camera),
+                          icon: const Icon(Icons.photo_camera),
+                          label: const Text('Camera')),
+                      const SizedBox(width: 8),
+                      OutlinedButton.icon(
+                          onPressed: () => pick(ImageSource.gallery),
+                          icon: const Icon(Icons.photo),
+                          label: const Text('Gallery')),
+                    ]),
+                    Wrap(spacing: 6, runSpacing: 6, children: [
+                      for (final n in imgs)
+                        GestureDetector(
+                          onTap: () => Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                  builder: (_) => Scaffold(
+                                      appBar: AppBar(),
+                                      body: InteractiveViewer(
+                                          child: Center(child: Image.file(File('${Store.dir.path}/img/$n'))))))),
+                          onLongPress: () => setState(() => imgs.remove(n)),
+                          child: Image.file(File('${Store.dir.path}/img/$n'), width: 100, height: 100, fit: BoxFit.cover),
+                        )
+                    ]),
+                    if (imgs.isNotEmpty) const Text('Long-press a photo to remove', style: TextStyle(fontSize: 11)),
+                    if (hist.isNotEmpty) ...[
+                      const Divider(height: 28),
+                      const Text('Adjournment history', style: TextStyle(fontWeight: FontWeight.bold)),
+                      for (final h in hist.reversed)
+                        ListTile(
+                            dense: true,
+                            leading: const Icon(Icons.history),
+                            title: Text('${fmt.format(DateTime.parse(h['from']))}  →  ${fmt.format(DateTime.parse(h['to']))}')),
+                    ],
+                  ]),
+                );
+          }
+
+          class SettingsPage extends StatefulWidget {
+            const SettingsPage({super.key});
+            @override
+            State<SettingsPage> createState() => _SettingsPageState();
+          }
+
+          class _SettingsPageState extends State<SettingsPage> {
+            bool busy = false;
+            Future<void> run(String ok, Future<bool> Function() f) async {
+              setState(() => busy = true);
+              try {
+                toast(context, await f() ? ok : 'Failed / nothing found');
+              } catch (e) {
+                toast(context, 'Error: $e');
+              }
+              if (mounted) setState(() => busy = false);
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final s = Store.s;
+              final days = List<int>.from(s['days']);
+              final last = DateTime.tryParse(s['last'] ?? '');
+              return Scaffold(
+                appBar: AppBar(title: const Text('Settings')),
+                body: ListView(padding: const EdgeInsets.all(12), children: [
+                  const Text('Theme', style: TextStyle(fontWeight: FontWeight.bold)),
+                  SegmentedButton<String>(
+                    segments: const [
+                      ButtonSegment(value: 'light', label: Text('Day'), icon: Icon(Icons.light_mode)),
+                      ButtonSegment(value: 'dark', label: Text('Night'), icon: Icon(Icons.dark_mode)),
+                      ButtonSegment(value: 'system', label: Text('Auto')),
+                    ],
+                    selected: {s['theme']},
+                    onSelectionChanged: (v) {
+                      s['theme'] = v.first;
+                      themeN.value = modeOf(v.first);
+                      Store.save();
+                      setState(() {});
+                    },
+                  ),
+                  const Divider(height: 28),
+                  const Text('Remind me before hearing', style: TextStyle(fontWeight: FontWeight.bold)),
+                  Wrap(spacing: 8, children: [
+                    for (final d in [0, 1, 2, 3, 7])
+                      FilterChip(
+                        label: Text(d == 0 ? 'Same day' : '$d day${d > 1 ? 's' : ''}'),
+                        selected: days.contains(d),
+                        onSelected: (v) {
+                          v ? days.add(d) : days.remove(d);
+                          s['days'] = days;
+                          Store.save();
+                          reschedule();
+                          setState(() {});
+                        },
+                      )
+                  ]),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.alarm),
+                    title: Text('Reminder time: ${TimeOfDay(hour: s['hour'], minute: s['minute']).format(context)}'),
+                    onTap: () async {
+                      final t = await showTimePicker(
+                          context: context, initialTime: TimeOfDay(hour: s['hour'], minute: s['minute']));
+                      if (t != null) {
+                        s['hour'] = t.hour;
+                        s['minute'] = t.minute;
+                        Store.save();
+                        reschedule();
+                        setState(() {});
+                      }
+                    },
+                  ),
+                  const Divider(height: 28),
+                  const Text('Backup & restore', style: TextStyle(fontWeight: FontWeight.bold)),
+                  if (busy) const LinearProgressIndicator(),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Automatic Google Drive backup'),
+                    subtitle: Text(last == null ? 'Never backed up' : 'Last: ${DateFormat('dd MMM yyyy, hh:mm a').format(last)}'),
+                    value: s['auto'] == true,
+                    onChanged: (v) async {
+                      s['auto'] = v;
+                      Store.save();
+                      setState(() {});
+                      if (v) await run('Drive backup done', () => driveUpload());
+                    },
+                  ),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Back up every'),
+                    trailing: DropdownButton<int>(
+                      value: s['interval'],
+                      items: const [
+                        DropdownMenuItem(value: 1, child: Text('1 day')),
+                        DropdownMenuItem(value: 3, child: Text('3 days')),
+                        DropdownMenuItem(value: 7, child: Text('7 days')),
+                        DropdownMenuItem(value: 30, child: Text('30 days')),
+                      ],
+                      onChanged: (v) {
+                        s['interval'] = v;
+                        Store.save();
+                        setState(() {});
+                      },
+                    ),
+                  ),
+                  FilledButton.icon(
+                      onPressed: busy ? null : () => run('Backed up to Google Drive', () => driveUpload()),
+                      icon: const Icon(Icons.cloud_upload),
+                      label: const Text('Backup to Google Drive now')),
+                  OutlinedButton.icon(
+                      onPressed: busy ? null : () => run('Restored from Google Drive', driveRestore),
+                      icon: const Icon(Icons.cloud_download),
+                      label: const Text('Restore from Google Drive')),
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                      onPressed: busy
+                          ? null
+                          : () async {
+                              final d = await getTemporaryDirectory();
+                              final f = File('${d.path}/advocate_backup_${DateFormat('yyyyMMdd').format(DateTime.now())}.zip')
+                                ..writeAsBytesSync(buildZip());
+                              await Share.shareXFiles([XFile(f.path)]);
+                            },
+                      icon: const Icon(Icons.share),
+                      label: const Text('Save backup file (Drive / phone / WhatsApp)')),
+                  OutlinedButton.icon(
+                      onPressed: busy
+                          ? null
+                          : () => run('Restored from file', () async {
+                                final r = await FilePicker.platform.pickFiles();
+                                if (r == null || r.files.single.path == null) return false;
+                                await restoreZip(File(r.files.single.path!).readAsBytesSync());
+                                return true;
+                              }),
+                      icon: const Icon(Icons.restore),
+                      label: const Text('Restore from backup file')),
+                  const SizedBox(height: 24),
+                  const Center(child: Text('Made by Shaik Ziya', style: TextStyle(fontWeight: FontWeight.w600))),
+                ]),
+              );
+            }
+          }
+          EOF
       - name: Create Android project and copy app code
         run: |
           flutter create --platforms=android --org com.ziya --project-name advocate_diary app
           rm -rf app/test app/lib
           cp -r src/lib app/lib
           cp src/pubspec.yaml app/pubspec.yaml
-      - name: Use fixed signing key (needed for Google Drive sign-in)
+      - name: Use fixed signing key if present
         run: |
           mkdir -p ~/.android
           if [ -f debug.keystore ]; then cp debug.keystore ~/.android/debug.keystore; fi
-          keytool -list -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey | grep -E "SHA1|SHA-1" || true
       - name: Patch Gradle and Manifest
         run: |
           python3 - <<'PY'
